@@ -1,15 +1,13 @@
-﻿// Copyright 2009-2015 Josh Close and Contributors
+﻿// Copyright 2009-2020 Josh Close and Contributors
 // This file is a part of CsvHelper and is dual licensed under MS-PL and Apache 2.0.
 // See LICENSE.txt for details or visit http://www.opensource.org/licenses/ms-pl.html for MS-PL and http://opensource.org/licenses/Apache-2.0 for Apache 2.0.
-// http://csvhelper.com
+// https://github.com/JoshClose/CsvHelper
 using System;
-#if !NET_2_0
+using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
-#endif
 using System.Reflection;
 using CsvHelper.Configuration;
-using CsvHelper.TypeConversion;
 
 namespace CsvHelper
 {
@@ -18,147 +16,218 @@ namespace CsvHelper
 	/// </summary>
 	internal static class ReflectionHelper
 	{
+		private static readonly Dictionary<int, Dictionary<int, Delegate>> funcArgCache = new Dictionary<int, Dictionary<int, Delegate>>();
+		private static object locker = new object();
+
 		/// <summary>
-		/// Creates an instance of type T.
+		/// Creates an instance of type T using the current <see cref="IObjectResolver"/>.
 		/// </summary>
 		/// <typeparam name="T">The type of instance to create.</typeparam>
 		/// <param name="args">The constructor arguments.</param>
 		/// <returns>A new instance of type T.</returns>
-		public static T CreateInstance<T>( params object[] args )
+		public static T CreateInstance<T>(params object[] args)
 		{
-#if NET_2_0
-			return Activator.CreateInstance<T>();
-#else
-			return (T)CreateInstance( typeof( T ), args );
-#endif
+			return (T)CreateInstance(typeof(T), args);
 		}
 
 		/// <summary>
-		/// Creates an instance of the specified type.
+		/// Creates an instance of the specified type using the current <see cref="IObjectResolver"/>.
 		/// </summary>
 		/// <param name="type">The type of instance to create.</param>
 		/// <param name="args">The constructor arguments.</param>
 		/// <returns>A new instance of the specified type.</returns>
-		public static object CreateInstance( Type type, params object[] args )
+		public static object CreateInstance(Type type, params object[] args)
 		{
-#if NET_2_0
-			return Activator.CreateInstance( type, args );
-#else
+			return ObjectResolver.Current.Resolve(type, args);
+		}
 
-			var argumentTypes = args.Select( a => a.GetType() ).ToArray();
-			var argumentExpressions = argumentTypes.Select( ( t, i ) => Expression.Parameter( t, "var" + i ) ).ToArray();
-			var constructorInfo = type.GetConstructor( argumentTypes );
-			var constructor = Expression.New( constructorInfo, argumentExpressions );
-			var compiled = Expression.Lambda( constructor, argumentExpressions ).Compile();
+		/// <summary>
+		/// Creates an instance of the specified type without using the
+		/// current <see cref="IObjectResolver"/>.
+		/// </summary>
+		/// <param name="type">The type of instance to create.</param>
+		/// <param name="args">The constructor arguments.</param>
+		/// <returns>A new instance of the specified type.</returns>
+		public static object CreateInstanceWithoutContractResolver(Type type, params object[] args)
+		{
+			Dictionary<int, Delegate> funcCache;
+			lock (locker)
+			{
+				if (!funcArgCache.TryGetValue(args.Length, out funcCache))
+				{
+					funcArgCache[args.Length] = funcCache = new Dictionary<int, Delegate>();
+				}
+			}
+
+			var typeHashCodes =
+				new List<Type> { type }
+				.Union(args.Select(a => a.GetType()))
+				.Select(t => t.UnderlyingSystemType.GetHashCode());
+			var key = string.Join("|", typeHashCodes).GetHashCode();
+
+			Delegate func;
+			lock (locker)
+			{
+				if (!funcCache.TryGetValue(key, out func))
+				{
+					funcCache[key] = func = CreateInstanceDelegate(type, args);
+				}
+			}
+
 			try
 			{
-				return compiled.DynamicInvoke( args );
+				return func.DynamicInvoke(args);
 			}
-			catch( TargetInvocationException ex )
+			catch (TargetInvocationException ex)
 			{
 				throw ex.InnerException;
 			}
-#endif
 		}
 
-#if !NET_2_0
 		/// <summary>
-		/// Gets the first attribute of type T on property.
+		/// Gets the <see cref="PropertyInfo"/> from the type where the property was declared.
 		/// </summary>
-		/// <typeparam name="T">Type of attribute to get.</typeparam>
-		/// <param name="property">The <see cref="PropertyInfo" /> to get the attribute from.</param>
-		/// <param name="inherit">True to search inheritance tree, otherwise false.</param>
-		/// <returns>The first attribute of type T, otherwise null.</returns>
-		public static T GetAttribute<T>( PropertyInfo property, bool inherit ) where T : Attribute
+		/// <param name="type">The type the property belongs to.</param>
+		/// <param name="property">The property to search.</param>
+		/// <param name="flags">Flags for how the property is retrieved.</param>
+		public static PropertyInfo GetDeclaringProperty(Type type, PropertyInfo property, BindingFlags flags)
 		{
-			T attribute = null;
-			var attributes = property.GetCustomAttributes( typeof( T ), inherit ).ToList();
-			if( attributes.Count > 0 )
+			if (property.DeclaringType != type)
 			{
-				attribute = attributes[0] as T;
-			}
-			return attribute;
-		}
-
-		/// <summary>
-		/// Gets the attributes of type T on property.
-		/// </summary>
-		/// <typeparam name="T">Type of attribute to get.</typeparam>
-		/// <param name="property">The <see cref="PropertyInfo" /> to get the attribute from.</param>
-		/// <param name="inherit">True to search inheritance tree, otherwise false.</param>
-		/// <returns>The attributes of type T.</returns>
-		public static T[] GetAttributes<T>( PropertyInfo property, bool inherit ) where T : Attribute
-		{
-			var attributes = property.GetCustomAttributes( typeof( T ), inherit );
-			return attributes.Cast<T>().ToArray();
-		}
-
-		/// <summary>
-		/// Gets the constructor <see cref="NewExpression"/> from the give <see cref="Expression"/>.
-		/// </summary>
-		/// <typeparam name="T">The <see cref="Type"/> of the object that will be constructed.</typeparam>
-		/// <param name="expression">The constructor <see cref="Expression"/>.</param>
-		/// <returns>A constructor <see cref="NewExpression"/>.</returns>
-		/// <exception cref="System.ArgumentException">Not a constructor expression.;expression</exception>
-		public static NewExpression GetConstructor<T>( Expression<Func<T>> expression )
-		{
-			var newExpression = expression.Body as NewExpression;
-			if( newExpression == null )
-			{
-				throw new ArgumentException( "Not a constructor expression.", "expression" );
-			}
-
-			return newExpression;
-		}
-
-		/// <summary>
-		/// Gets the property from the expression.
-		/// </summary>
-		/// <typeparam name="TModel">The type of the model.</typeparam>
-		/// <param name="expression">The expression.</param>
-		/// <returns>The <see cref="PropertyInfo"/> for the expression.</returns>
-		public static PropertyInfo GetProperty<TModel>( Expression<Func<TModel, object>> expression )
-		{
-			var member = GetMemberExpression( expression ).Member;
-			var property = member as PropertyInfo;
-			if( property == null )
-			{
-				throw new CsvConfigurationException( string.Format( "'{0}' is not a property. Did you try to map a field by accident?", member.Name ) );
+				var declaringProperty = property.DeclaringType.GetProperty(property.Name, flags);
+				return GetDeclaringProperty(property.DeclaringType, declaringProperty, flags);
 			}
 
 			return property;
 		}
 
 		/// <summary>
-		/// Gets the member expression.
+		/// Walk up the inheritance tree collecting properties. This will get a unique set or properties in the
+		/// case where parents have the same property names as children.
+		/// </summary>
+		/// <param name="type">The <see cref="Type"/> to get properties for.</param>
+		/// <param name="flags">The flags for getting the properties.</param>
+		/// <param name="overwrite">If true, parent class properties that are hidden by `new` child properties will be overwritten.</param>
+		public static List<PropertyInfo> GetUniqueProperties(Type type, BindingFlags flags, bool overwrite = false)
+		{
+			var properties = new Dictionary<string, PropertyInfo>();
+
+			flags |= BindingFlags.DeclaredOnly;
+			var currentType = type;
+			while (currentType != null)
+			{
+				var currentProperties = currentType.GetProperties(flags);
+				foreach (var property in currentProperties)
+				{
+					if (!properties.ContainsKey(property.Name) || overwrite)
+					{
+						properties[property.Name] = property;
+					}
+				}
+
+				currentType = currentType.BaseType;
+			}
+
+			return properties.Values.ToList();
+		}
+
+		/// <summary>
+		/// Gets the property from the expression.
 		/// </summary>
 		/// <typeparam name="TModel">The type of the model.</typeparam>
-		/// <typeparam name="T"></typeparam>
+		/// <typeparam name="TProperty">The type of the property.</typeparam>
 		/// <param name="expression">The expression.</param>
-		/// <returns></returns>
-		private static MemberExpression GetMemberExpression<TModel, T>( Expression<Func<TModel, T>> expression )
+		/// <returns>The <see cref="PropertyInfo"/> for the expression.</returns>
+		public static MemberInfo GetMember<TModel, TProperty>(Expression<Func<TModel, TProperty>> expression)
 		{
-			// This method was taken from FluentNHibernate.Utils.ReflectionHelper.cs and modified.
-			// http://fluentnhibernate.org/
-
-			MemberExpression memberExpression = null;
-			if( expression.Body.NodeType == ExpressionType.Convert )
+			var member = GetMemberExpression(expression.Body).Member;
+			var property = member as PropertyInfo;
+			if (property != null)
 			{
-				var body = (UnaryExpression)expression.Body;
+				return property;
+			}
+
+			var field = member as FieldInfo;
+			if (field != null)
+			{
+				return field;
+			}
+
+			throw new ConfigurationException($"'{member.Name}' is not a member.");
+		}
+
+		/// <summary>
+		/// Gets the member inheritance chain as a stack.
+		/// </summary>
+		/// <typeparam name="TModel">The type of the model.</typeparam>
+		/// <typeparam name="TProperty">The type of the property.</typeparam>
+		/// <param name="expression">The member expression.</param>
+		/// <returns>The inheritance chain for the given member expression as a stack.</returns>
+		public static Stack<MemberInfo> GetMembers<TModel, TProperty>(Expression<Func<TModel, TProperty>> expression)
+		{
+			var stack = new Stack<MemberInfo>();
+
+			var currentExpression = expression.Body;
+			while (true)
+			{
+				var memberExpression = GetMemberExpression(currentExpression);
+				if (memberExpression == null)
+				{
+					break;
+				}
+
+				stack.Push(memberExpression.Member);
+				currentExpression = memberExpression.Expression;
+			}
+
+			return stack;
+		}
+
+		private static MemberExpression GetMemberExpression(Expression expression)
+		{
+			MemberExpression memberExpression = null;
+			if (expression.NodeType == ExpressionType.Convert)
+			{
+				var body = (UnaryExpression)expression;
 				memberExpression = body.Operand as MemberExpression;
 			}
-			else if( expression.Body.NodeType == ExpressionType.MemberAccess )
+			else if (expression.NodeType == ExpressionType.MemberAccess)
 			{
-				memberExpression = expression.Body as MemberExpression;
-			}
-
-			if( memberExpression == null )
-			{
-				throw new ArgumentException( "Not a member access", "expression" );
+				memberExpression = expression as MemberExpression;
 			}
 
 			return memberExpression;
 		}
-#endif
+
+		private static T Default<T>()
+		{
+			return default(T);
+		}
+
+		private static Delegate CreateInstanceDelegate(Type type, params object[] args)
+		{
+			Delegate compiled;
+			if (type.GetTypeInfo().IsValueType)
+			{
+				var method = typeof(ReflectionHelper).GetMethod("Default", BindingFlags.Static | BindingFlags.NonPublic);
+				method = method.MakeGenericMethod(type);
+				compiled = Expression.Lambda(Expression.Call(method)).Compile();
+			}
+			else
+			{
+				var argumentTypes = args.Select(a => a.GetType()).ToArray();
+				var argumentExpressions = argumentTypes.Select((t, i) => Expression.Parameter(t, "var" + i)).ToArray();
+				var constructorInfo = type.GetConstructor(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, argumentTypes, null);
+				if (constructorInfo == null)
+				{
+					throw new InvalidOperationException("No public parameterless constructor found.");
+				}
+
+				var constructor = Expression.New(constructorInfo, argumentExpressions);
+				compiled = Expression.Lambda(constructor, argumentExpressions).Compile();
+			}
+
+			return compiled;
+		}
 	}
 }
